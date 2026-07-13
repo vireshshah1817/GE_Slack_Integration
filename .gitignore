@@ -1,2 +1,5 @@
 venv/
-
+app/__pycache__
+.env
+app/database/__pycache__
+app/security/__pycache__
