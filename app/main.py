@@ -2,6 +2,7 @@ import os
 import httpx
 import secrets
 import base64
+import threading
 from typing import Optional
 from dotenv import load_dotenv
 from datetime import datetime, timezone, timedelta
@@ -54,14 +55,27 @@ SessionLocal = sessionmaker(autocommit = False, autoflush = False, bind = engine
 # 3. The Command Handler
 @slack_app.command("/gemini-enterprise")
 def handle_gemini_command(ack, body, respond):
-    # Acknowledge the command request immediately to prevent Slack timeout
+    # 1. Instantly acknowledge the command (Must happen within 3 seconds)
     ack()
 
-    # Extract identity from the Slack payload
     slack_user_id = body.get("user_id")
     slack_workspace_id = body.get("team_id")
+    user_query = body.get("text", "").strip() 
     
-    # Open a database session
+    if not user_query:
+        respond("Please provide a prompt! Example: `/gemini-enterprise Tell me a joke.`")
+        return
+
+    # 2. Move the heavy API work to a background thread
+    # This prevents the main thread from blocking, stopping the Slack timeout
+    thread = threading.Thread(
+        target = execute_gemini_query_in_background,
+        args = (slack_user_id, slack_workspace_id, user_query, respond)
+    )
+    thread.start()
+
+
+def execute_gemini_query_in_background(slack_user_id, slack_workspace_id, user_query, respond):
     db = SessionLocal()
     try:
         credential = db.query(UserCredential).filter(
@@ -69,71 +83,10 @@ def handle_gemini_command(ack, body, respond):
             UserCredential.slack_user_id == slack_user_id
         ).first()
 
-        if credential:
-            # 1. Decrypt the token securely in memory
-            access_token = crypto_service.decrypt(credential.encrypted_access_token)
-            
-            # 2. Prepare the request to Gemini Enterprise (Vertex AI API)
-            # NOTE: Replace GCP_PROJECT_ID with your actual Google Cloud Project ID
-            gcp_project_id = os.environ.get("GCP_PROJECT_ID")
-            location = "us-central1"
-            model_id = "gemini-1.5-pro-preview-0409" # Or your approved enterprise model
-            
-            url = f"https://{location}-aiplatform.googleapis.com/v1/projects/{gcp_project_id}/locations/{location}/publishers/google/models/{model_id}:generateContent"
-            
-            headers = {
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json"
-            }
-            
-            payload = {
-                "contents": [
-                    {
-                        "role": "user",
-                        "parts": [{"text": user_query}]
-                    }
-                ]
-            }
-            
-            # Let the user know we are processing (ephemeral)
-            respond(f"⏳ _Sending your query to Gemini Enterprise..._")
-            
-            # Make the synchronous call (or use httpx for async)
-            import requests
-            response = requests.post(url, headers=headers, json=payload)
-            
-            if response.status_code == 200:
-                data = response.json()
-                try:
-                    # Extract the text from the Gemini response structure
-                    ai_text = data["candidates"][0]["content"]["parts"][0]["text"]
-                    
-                    # --- TASK 3.2: Format the Slack Response ---
-                    # Using Block Kit to make it look professional
-                    blocks = [
-                        {
-                            "type": "section",
-                            "text": {
-                                "type": "mrkdwn",
-                                "text": f"*Prompt:* {user_query}\n\n*Response:*\n{ai_text}"
-                            }
-                        }
-                    ]
-                    # We use respond to post it back to the channel/user
-                    respond(blocks=blocks)
-                    
-                except KeyError:
-                    respond("⚠️ Received an unexpected response format from Gemini.")
-            elif response.status_code == 401:
-                # This means the token expired! We'll handle this in Task 3.3
-                respond("❌ Your session expired. We need to build the refresh logic!")
-            else:
-                respond(f"⚠️ API Error {response.status_code}: {response.text}")
-        else:
-            # Build the URL pointing to your local app (passing Slack context via query params)
-            # Note: In production, you would use your actual domain instead of ngrok
+        if not credential:
+            # Send the login button if they somehow aren't authenticated
             login_url = f"https://approval-mankind-flask.ngrok-free.dev/auth/login?slack_user_id={slack_user_id}&slack_workspace_id={slack_workspace_id}"
-
+            
             blocks = [
                 {
                     "type": "section",
@@ -158,8 +111,67 @@ def handle_gemini_command(ack, body, respond):
                     ]
                 }
             ]
-            # Respond with rich blocks instead of plain text
             respond(blocks=blocks)
+            return
+
+        # Tell the user we are working on it (visible only to them)
+        respond("⏳ _Gemini Enterprise is thinking..._")
+
+        # Decrypt the token
+        access_token = crypto_service.decrypt(credential.encrypted_access_token) #type: ignore
+        
+        # Build your Gemini Enterprise (Discovery Engine) call
+        gcp_project_id = os.environ.get("GCP_PROJECT_ID", "project-4-workndemos")
+        print("=========== GCP Project ID: =======", gcp_project_id)
+        
+        location = "global"
+        engine_id = "viresh-engineering-app_1779273678265"
+        
+        # Gemini Enterprise apps use the Discovery Engine API
+        url = f"https://discoveryengine.googleapis.com/v1/projects/{gcp_project_id}/locations/{location}/collections/default_collection/engines/{engine_id}/conversations/-:converse"
+        
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json"
+        }
+        
+        # The payload structure is specific for the Discovery Engine converse API
+        payload = {
+            "query": {
+                "input": user_query
+            }
+        }
+        
+        import requests
+        response = requests.post(url, headers = headers, json = payload)
+        
+        if response.status_code == 200:
+            data = response.json()
+            
+            # Extract the AI's reply. We use a try/except to safely handle 
+            # variations in the response structure based on your specific Agent configuration.
+            try:
+                ai_text = data["reply"]["reply"]
+            except KeyError:
+                # If the structure differs, we print the raw JSON so you can see it in Slack
+                ai_text = f"```\n{data}\n```" 
+            
+            # Send the final response to the channel
+            respond(blocks=[
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*Prompt:* {user_query}\n\n*Response:*\n{ai_text}"
+                    }
+                }
+            ], response_type="in_channel") 
+            
+        else:
+            respond(f"⚠️ Gemini Enterprise API Error {response.status_code}: {response.text}")
+
+    except Exception as e:
+        respond(f"⚠️ An error occurred while processing your request: {str(e)}")
     finally:
         db.close()
 
@@ -184,7 +196,7 @@ async def auth_login(slack_user_id: str, slack_workspace_id: str):
         f"&redirect_uri={REDIRECT_URI}"
         f"&response_type=code"
         f"&scope={scopes}"
-        f"&state={safe_state}" # Use the encoded state here
+        f"&state={safe_state}"
         f"&access_type=offline"
         f"&prompt=consent"
     )
